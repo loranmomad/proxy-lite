@@ -11,6 +11,10 @@ import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.io.BufferedReader
+import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.net.Socket
@@ -18,7 +22,7 @@ import java.net.Socket
 class ProxyVpnService : VpnService() {
 
     private var pfd: ParcelFileDescriptor? = null
-    private var workerThread: Thread? = null
+    private var tun2socksProcess: Process? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -41,42 +45,87 @@ class ProxyVpnService : VpnService() {
 
     private fun startVpn(profile: ProxyProfile) {
         try {
-            // Verify the proxy host is reachable (simulated connectivity check)
+            // Verify the proxy host is reachable
             verifyProxy(profile)
 
-            // Configure the VPN interface
+            // Configure the VPN interface to capture ALL traffic
             val builder = Builder()
                 .setSession("SuperProxyLite")
                 .addAddress("10.0.0.2", 24)
-                .addRoute("0.0.0.0", 0)
+                .addRoute("0.0.0.0", 0) // Route all traffic
                 .addDnsServer("8.8.8.8")
                 .setMtu(1500)
-                .setBlocking(false) // Non-blocking to prevent ANRs
+                .setBlocking(false)
 
             pfd = builder.establish()
+            if (pfd == null) {
+                Log.e(TAG, "Failed to establish VPN interface")
+                stopVpn()
+                return
+            }
+
             Log.i(TAG, "VPN established; pfd=$pfd; proxy=${profile.host}:${profile.port} (${profile.type})")
 
-            // Simulated proxy routing loop
-            // NOTE: To actually route traffic, you must plug a tun2socks engine here 
-            // to read raw IP packets from `pfd` and forward them via the proxy.
-            workerThread = Thread {
-                try {
-                    while (!Thread.interrupted() && pfd != null) {
-                        Thread.sleep(1000)
-                    }
-                } catch (e: InterruptedException) {
-                    Log.i(TAG, "Worker interrupted")
-                }
-            }.apply { isDaemon = true; start() }
+            // Start the native tun2socks engine to route raw packets to the proxy
+            startTun2Socks(profile)
 
             ProxyManager.setVpnActive(this, true)
             TileSyncer.requestUpdate(this)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start VPN", e)
-            ProxyManager.setVpnActive(this, false)
-            TileSyncer.requestUpdate(this)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            stopVpn()
+        }
+    }
+
+    private fun startTun2Socks(profile: ProxyProfile) {
+        try {
+            // 1. Copy the tun2socks binary from assets to internal storage
+            val binaryFile = File(filesDir, "tun2socks")
+            if (!binaryFile.exists()) {
+                assets.open("tun2socks").use { input ->
+                    FileOutputStream(binaryFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                binaryFile.setExecutable(true)
+                Log.i(TAG, "tun2socks binary copied and made executable")
+            }
+
+            // 2. Build the proxy URL argument
+            val proxyUrl = if (profile.type == "SOCKS5") {
+                "socks5://${profile.host}:${profile.port}"
+            } else {
+                "http://${profile.host}:${profile.port}"
+            }
+
+            // 3. Run the binary, passing the VPN file descriptor
+            // NOTE: The arguments depend on which tun2socks binary you use. 
+            // This example uses the standard go-tun2socks arguments.
+            val processBuilder = ProcessBuilder(
+                binaryFile.absolutePath,
+                "--fd", pfd!!.fd.toString(),
+                "--proxy", proxyUrl,
+                "--loglevel", "warning"
+            )
+            
+            tun2socksProcess = processBuilder.redirectErrorStream(true).start()
+            
+            // 4. Log the output of tun2socks for debugging
+            Thread {
+                try {
+                    val reader = BufferedReader(InputStreamReader(tun2socksProcess!!.inputStream))
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        Log.i("Tun2Socks", line ?: "")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "tun2socks output reader error", e)
+                }
+            }.start()
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start tun2socks. Did you put the binary in assets?", e)
+            stopVpn()
         }
     }
 
@@ -86,14 +135,8 @@ class ProxyVpnService : VpnService() {
                 val socket = Socket()
                 
                 // CRITICAL: Protect the socket so it doesn't route through our own VPN
-                // This prevents an infinite loop and allows the proxy connection to work.
                 protect(socket)
 
-                val proxy = if (profile.type == "SOCKS5")
-                    Proxy(Proxy.Type.SOCKS, InetSocketAddress(profile.host, profile.port))
-                else
-                    Proxy(Proxy.Type.HTTP, InetSocketAddress(profile.host, profile.port))
-                    
                 socket.connect(InetSocketAddress(profile.host, profile.port), 3000)
                 socket.close()
                 Log.i(TAG, "Proxy probe succeeded for ${profile.host}")
@@ -105,12 +148,13 @@ class ProxyVpnService : VpnService() {
 
     private fun stopVpn() {
         try {
-            workerThread?.interrupt()
+            tun2socksProcess?.destroy()
             pfd?.close()
         } catch (e: Exception) {
-            Log.e(TAG, "Error closing pfd", e)
+            Log.e(TAG, "Error closing pfd/process", e)
         }
         pfd = null
+        tun2socksProcess = null
         ProxyManager.setVpnActive(this, false)
         TileSyncer.requestUpdate(this)
     }
